@@ -218,6 +218,40 @@ class Store:
             sha = status["files"][kind]["sha256"]
             return status, self.blob_path(sha)
 
+    # ----------------------------------------------------------------- bundle
+
+    def bundle_snapshot(self, key: str) -> dict | None:
+        """Confirm the key and snapshot its confirmed files in one transaction.
+
+        Returns the hit status (including per-kind sha256/size and the
+        confirming build ids), or ``None`` when the key is not a hit (miss /
+        unknown / disabled -- callers inspect ``status`` to tell them apart).
+        """
+        with closing(self._connect()) as conn, _tx(conn):
+            status = self._key_status(conn, key)
+            if status["status"] != "hit":
+                return None
+            return status
+
+    def recheck_bundle(self, key: str, files: dict) -> dict | None:
+        """Re-evaluate the key after packaging, in a fresh transaction.
+
+        Returns the current hit status only when the key is still a hit *and*
+        every confirmed file still has exactly the digest/size packaged into
+        the ZIP. Otherwise returns the current (miss/disabled) status so the
+        caller can answer with the appropriate rebuild hint.
+        """
+        with closing(self._connect()) as conn, _tx(conn):
+            status = self._key_status(conn, key)
+            if status["status"] != "hit":
+                return status
+            current = status["files"]
+            if any(
+                current.get(kind) != meta for kind, meta in files.items()
+            ):
+                return status
+            return None
+
     # ----------------------------------------------------------------- intern
 
     def _build_files(self, conn, key: str, build: str) -> dict:

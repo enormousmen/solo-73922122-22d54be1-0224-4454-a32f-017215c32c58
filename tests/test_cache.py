@@ -2,18 +2,23 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import socket
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import httpx
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
+from app import bundle as bundle_mod
 from app.config import Settings
 from app.main import create_app
+from app.store import Store
 
 IMAGE = b"firmware-image-bytes" * 64
 SYMBOLS = b"debug-symbols-bytes" * 64
@@ -361,3 +366,255 @@ def test_concurrent_mismatch_yields_only_hit_or_disabled(live_server):
     assert errors == []
     with httpx.Client(base_url=live_server) as c:
         assert c.get(f"/v1/keys/{key}").json()["status"] == "disabled"
+
+
+# --------------------------------------------------------------- bundle API
+
+
+def _unzip(content: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        assert zf.testzip() is None
+        return {info.filename: zf.read(info) for info in zf.infolist()}
+
+
+def test_bundle_miss_and_disabled_status_codes(client):
+    r = client.get("/v1/keys/k1/bundle")
+    assert r.status_code == 404
+    assert r.json()["status"] == "miss"
+
+    submit(client, "k1", "builder-1", symbols=SYMBOLS)
+    submit(client, "k1", "builder-2", symbols=OTHER_SYMBOLS)
+
+    r = client.get("/v1/keys/k1/bundle")
+    assert r.status_code == 409
+    body = r.json()
+    # disabled key keeps the original rebuild hint
+    assert body["status"] == "disabled"
+    assert body["action"] == "rebuild"
+    assert body["differences"]
+
+
+def test_bundle_hit_contains_both_confirmed_files(client):
+    submit(client, "k1", "builder-1")
+    submit(client, "k1", "builder-2")
+
+    r = client.get("/v1/keys/k1/bundle")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    assert r.headers["x-image-sha256"] == sha256(IMAGE)
+    assert r.headers["x-symbols-sha256"] == sha256(SYMBOLS)
+    assert r.headers["x-confirmed-by"] == "builder-1,builder-2"
+    assert int(r.headers["content-length"]) == len(r.content)
+
+    entries = _unzip(r.content)
+    assert entries == {
+        "k1-image.bin": IMAGE,
+        "k1-symbols.bin": SYMBOLS,
+    }
+    # temp ZIPs are cleaned up after the response
+    assert not list(Path(client.app.state.store.tmp_dir).glob("bundle-*.zip"))
+
+
+def test_bundle_rebuild_hint_when_blob_missing(tmp_path):
+    with make_client(tmp_path) as c:
+        submit(c, "k1", "builder-1")
+        submit(c, "k1", "builder-2")
+        store = c.app.state.store
+        sha = c.get("/v1/keys/k1").json()["files"]["image"]["sha256"]
+        (Path(store.blob_dir) / sha).unlink()  # simulate lost artifact
+
+        r = c.get("/v1/keys/k1/bundle")
+        assert r.status_code == 409
+        body = r.json()
+        assert body["action"] == "rebuild"
+        assert body["status"] == "bundle_unavailable"
+        assert body["problems"] == [
+            {"file": "image", "issue": "missing", "expected_sha256": sha}
+        ]
+        assert not list(Path(store.tmp_dir).glob("bundle-*.zip"))
+
+
+def test_bundle_rebuild_hint_when_blob_truncated(tmp_path):
+    with make_client(tmp_path) as c:
+        submit(c, "k1", "builder-1")
+        submit(c, "k1", "builder-2")
+        store = c.app.state.store
+        sha = c.get("/v1/keys/k1").json()["files"]["symbols"]["sha256"]
+        path = Path(store.blob_dir) / sha
+        path.write_bytes(path.read_bytes()[:-7])  # truncate on disk
+
+        r = c.get("/v1/keys/k1/bundle")
+        assert r.status_code == 409
+        body = r.json()
+        assert body["action"] == "rebuild"
+        problem = body["problems"][0]
+        assert problem["file"] == "symbols"
+        assert problem["issue"] == "size_mismatch"
+        assert problem["actual_size"] == problem["expected_size"] - 7
+
+
+def test_bundle_rebuild_hint_when_digest_drifts_same_size(tmp_path):
+    with make_client(tmp_path) as c:
+        submit(c, "k1", "builder-1")
+        submit(c, "k1", "builder-2")
+        store = c.app.state.store
+        sha = c.get("/v1/keys/k1").json()["files"]["image"]["sha256"]
+        path = Path(store.blob_dir) / sha
+        data = bytearray(path.read_bytes())
+        data[0] ^= 0xFF  # same length, different bytes
+        path.write_bytes(data)
+
+        r = c.get("/v1/keys/k1/bundle")
+        assert r.status_code == 409
+        body = r.json()
+        assert body["action"] == "rebuild"
+        problem = body["problems"][0]
+        assert problem["file"] == "image"
+        assert problem["issue"] == "digest_mismatch"
+        assert problem["expected_sha256"] == sha
+        assert problem["actual_sha256"] == sha256(bytes(data))
+
+
+def _make_hit(server: str, key: str) -> None:
+    with httpx.Client(base_url=server, timeout=10) as c:
+        for b in ("builder-1", "builder-2"):
+            for kind, data in (("image", IMAGE), ("symbols", SYMBOLS)):
+                r = c.put(f"/v1/keys/{key}/builds/{b}/files/{kind}", content=data)
+                assert r.status_code == 200, r.text
+            assert c.post(
+                f"/v1/keys/{key}/builds/{b}/commit"
+            ).status_code == 200
+
+
+def _disable_with_third_builder(server: str, key: str) -> None:
+    with httpx.Client(base_url=server, timeout=10) as c:
+        for kind, data in (("image", IMAGE), ("symbols", OTHER_SYMBOLS)):
+            r = c.put(
+                f"/v1/keys/{key}/builds/builder-3/files/{kind}", content=data
+            )
+            assert r.status_code == 200, r.text
+        c.post(f"/v1/keys/{key}/builds/builder-3/commit")
+
+
+def test_bundle_key_disabled_during_packaging_returns_rebuild(live_server):
+    key = "bundle-race-1"
+    _make_hit(live_server, key)
+    holder: dict = {}
+    entered = threading.Event()
+    release = threading.Event()
+    original = bundle_mod.build_bundle
+
+    def slow_build(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    bundle_mod.build_bundle = slow_build
+    try:
+        def fetch():
+            with httpx.Client(base_url=live_server, timeout=20) as c:
+                holder["resp"] = c.get(f"/v1/keys/{key}/bundle")
+
+        t = threading.Thread(target=fetch)
+        t.start()
+        assert entered.wait(timeout=10)
+
+        # third machine commits a conflicting result while the ZIP is built
+        _disable_with_third_builder(live_server, key)
+        assert httpx.get(f"{live_server}/v1/keys/{key}", timeout=5).json()[
+            "status"
+        ] == "disabled"
+
+        release.set()
+        t.join(timeout=20)
+    finally:
+        bundle_mod.build_bundle = original
+
+    r = holder["resp"]
+    assert r.status_code == 409
+    body = r.json()
+    # the original disabled/rebuild hint, not a bundle-specific one
+    assert body["status"] == "disabled"
+    assert body["action"] == "rebuild"
+    assert body["differences"]
+
+
+def test_bundle_approved_zip_finishes_even_if_key_disabled_after(live_server):
+    key = "bundle-race-2"
+    _make_hit(live_server, key)
+    holder: dict = {}
+    approved = threading.Event()
+    real_recheck = Store.recheck_bundle
+
+    def recheck_then_signal(self, k, files):
+        result = real_recheck(self, k, files)
+        approved.set()
+        return result
+
+    Store.recheck_bundle = recheck_then_signal
+    try:
+        def fetch():
+            with httpx.Client(base_url=live_server, timeout=20) as c:
+                holder["resp"] = c.get(f"/v1/keys/{key}/bundle")
+
+        t = threading.Thread(target=fetch)
+        t.start()
+        assert approved.wait(timeout=10)
+
+        # disable the key only after the ZIP was approved for sending
+        _disable_with_third_builder(live_server, key)
+        t.join(timeout=20)
+    finally:
+        Store.recheck_bundle = real_recheck
+
+    r = holder["resp"]
+    assert r.status_code == 200
+    entries = _unzip(r.content)
+    assert entries == {
+        f"{key}-image.bin": IMAGE,
+        f"{key}-symbols.bin": SYMBOLS,
+    }
+
+
+def test_other_keys_keep_working_while_bundle_is_packaged(live_server):
+    hot = "bundle-busy"
+    other = "other-key"
+    _make_hit(live_server, hot)
+    entered = threading.Event()
+    release = threading.Event()
+    original = bundle_mod.build_bundle
+
+    def slow_build(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    bundle_mod.build_bundle = slow_build
+    try:
+        holder: dict = {}
+
+        def fetch():
+            with httpx.Client(base_url=live_server, timeout=20) as c:
+                holder["resp"] = c.get(f"/v1/keys/{hot}/bundle")
+
+        t = threading.Thread(target=fetch)
+        t.start()
+        assert entered.wait(timeout=10)
+
+        # a different key commits through a full build mid-packaging
+        _make_hit(live_server, other)
+        with httpx.Client(base_url=live_server, timeout=10) as c:
+            assert c.get(f"/v1/keys/{other}").json()["status"] == "hit"
+            r = c.get(f"/v1/keys/{other}/files/image")
+            assert r.status_code == 200 and r.content == IMAGE
+
+        release.set()
+        t.join(timeout=20)
+    finally:
+        bundle_mod.build_bundle = original
+
+    assert holder["resp"].status_code == 200
+    assert set(_unzip(holder["resp"].content)) == {
+        f"{hot}-image.bin",
+        f"{hot}-symbols.bin",
+    }

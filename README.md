@@ -34,9 +34,23 @@ CI:
 
 ```
 GET  /v1/keys/{key}                # hit | miss | disabled (+ rebuild details)
-GET  /v1/keys/{key}/files/image    # 200 bytes | 404 miss | 409 disabled
+GET  /v1/keys/{key}/bundle         # one ZIP with both confirmed files
+GET  /v1/keys/{key}/files/image    # single-file pickup (still supported)
 GET  /v1/keys/{key}/files/symbols
 ```
+
+The bundle endpoint is the recommended pickup path: it answers one request
+with a single ZIP containing **both** confirmed files, so a conflicting
+commit landing between two separate downloads can never leave CI with only
+half of the artifact set.
+
+Bundle responses:
+
+| Code | Meaning                                                                 |
+|------|-------------------------------------------------------------------------|
+| 200  | `application/zip` with `{key}-image.bin` and `{key}-symbols.bin`; `X-Image-SHA256`, `X-Symbols-SHA256`, `X-Confirmed-By` headers |
+| 404  | key unknown or still a miss (body is the key status)                   |
+| 409  | key disabled (the persisted rebuild hint with both digests), or the confirmed files failed verification/changed while packaging (`status=bundle_unavailable`, `action=rebuild`, per-file `problems`) |
 
 Interactive docs at `/docs`. See `examples/demo.sh` for a full walkthrough.
 
@@ -52,6 +66,16 @@ Interactive docs at `/docs`. See `examples/demo.sh` for a full walkthrough.
 - **Hit**: ≥ `quorum` committed builds with identical digests for both files.
   Fetches are evaluated in one transaction, so CI either downloads the
   confirmed artifact set or gets a miss — never a partial/torn state.
+- **Atomic bundle pickup**: `GET /v1/keys/{key}/bundle` snapshots the
+  confirmed digests in one transaction, builds a ZIP outside any DB
+  transaction (other keys keep committing/fetching meanwhile; each file may
+  still be up to 32 MiB), verifies every entry's length and SHA-256 against
+  the snapshot, and only then re-checks the key in a fresh transaction.
+  Missing blobs, unreadable/truncated bytes, or length/digest mismatches
+  produce a `409` rebuild hint with per-file problems. If the key was
+  disabled during packaging, the response is the original disabled/rebuild
+  hint; once the second check approves the ZIP, it is transmitted to
+  completion even if the key is disabled afterwards.
 - **Mismatch**: if any two committed builds differ, the key is disabled.
   `GET /v1/keys/{key}` then returns `status=disabled`, `action=rebuild`, and
   the differing files with both sides' digests; downloads return `409`.

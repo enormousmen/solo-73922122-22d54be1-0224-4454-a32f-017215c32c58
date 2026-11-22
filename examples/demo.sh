@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Demo: two builders agree -> cache hit; a third uploading in parts does not
-# disturb fetches; a diverging commit disables the key and asks for a rebuild.
+# Demo: two builders agree -> cache hit; CI fetches both confirmed files in
+# ONE atomic bundle (ZIP) download; a third uploading in parts does not
+# disturb fetches; a diverging commit disables the key and bundle pickup
+# answers with the original rebuild hint.
 #
 # Usage:  ./examples/demo.sh [BASE_URL]      (default http://localhost:8080)
 set -euo pipefail
 
 BASE="${1:-http://localhost:8080}"
-KEY="demo-fw-1.2.3"
+KEY="demo-fw-1.2.3-$$"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -38,11 +40,23 @@ commit "$KEY" builder-2 | pp
 echo "--- key status (two machines agree):"
 status "$KEY" | pp
 
-echo; echo "### CI downloads the confirmed artifacts and verifies bytes"
-curl -sS -o "$WORK/dl-image.bin"   "$BASE/v1/keys/$KEY/files/image"
-curl -sS -o "$WORK/dl-symbols.bin" "$BASE/v1/keys/$KEY/files/symbols"
-cmp "$WORK/image.bin"   "$WORK/dl-image.bin"   && echo "image OK"
-cmp "$WORK/symbols.bin" "$WORK/dl-symbols.bin" && echo "symbols OK"
+echo; echo "### CI picks up the confirmed set in ONE bundle download"
+code=$(curl -sS -o "$WORK/bundle.zip" -w '%{http_code}' \
+  "$BASE/v1/keys/$KEY/bundle")
+echo "HTTP $code, $(stat -c %s "$WORK/bundle.zip") bytes"
+python3 - "$WORK" "$KEY" <<'PY'
+import sys, zipfile, pathlib
+work = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+with zipfile.ZipFile(work / "bundle.zip") as zf:
+    assert zf.testzip() is None
+    zf.extractall(work / "unpacked")
+for kind in ("image", "symbols"):
+    original = work / f"{kind}.bin"
+    got = work / "unpacked" / f"{key}-{kind}.bin"
+    assert original.read_bytes() == got.read_bytes(), kind
+    print(f"{kind} OK")
+PY
 
 echo; echo "### builder-3 uploads IN PARTS (staged, not committed)"
 head -c 262144 /dev/urandom > "$WORK/other-symbols.bin"
@@ -57,7 +71,8 @@ upload "$KEY" builder-3 symbols "$WORK/other-symbols.bin"; echo
 commit "$KEY" builder-3 | pp
 echo "--- key status (key disabled, rebuild hinted, both digests listed):"
 status "$KEY" | pp
-echo "--- fetch attempt now:"
-code=$(curl -sS -o "$WORK/fetch.json" -w '%{http_code}' "$BASE/v1/keys/$KEY/files/symbols")
+echo "--- bundle pickup attempt now (original disabled/rebuild hint):"
+code=$(curl -sS -o "$WORK/fetch.json" -w '%{http_code}' \
+  "$BASE/v1/keys/$KEY/bundle")
 pp < "$WORK/fetch.json"
 echo "HTTP $code"

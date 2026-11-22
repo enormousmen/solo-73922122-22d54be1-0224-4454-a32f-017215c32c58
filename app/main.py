@@ -7,9 +7,10 @@ import os
 import re
 import tempfile
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from . import bundle as bundle_mod
 from .config import Settings, load_settings
 from .store import (
     REQUIRED_KINDS,
@@ -142,7 +143,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"X-SHA256": sha, "ETag": sha},
         )
 
+    @app.get("/v1/keys/{key}/bundle")
+    def download_bundle(key: str, background: BackgroundTasks):
+        """Atomic pickup: one ZIP with both confirmed files.
+
+        The send decision is made twice around packaging: once before (do not
+        even start unless the key is a confirmed hit) and again once the ZIP
+        is fully assembled and verified. A key disabled in between still gets
+        the original disabled/rebuild hint; once the second check approved the
+        ZIP, it is transmitted to completion. No DB transaction is held while
+        the ZIP is built, so other keys keep committing/fetching.
+        """
+        _check_name(key, "input key")
+
+        snapshot = store.bundle_snapshot(key)
+        if snapshot is None:
+            # Unknown/missed keys answer 404; disabled keys keep their
+            # original rebuild hint with 409, mirroring single-file GETs.
+            probe = store.key_status(key)
+            code = 409 if probe["status"] == "disabled" else 404
+            return JSONResponse(status_code=code, content=probe)
+
+        files = snapshot["files"]
+        try:
+            zip_path, zip_size = bundle_mod.build_bundle(
+                store.tmp_dir, store.blob_path, files, key
+            )
+        except bundle_mod.BundleIntegrityError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "input_key": key,
+                    "status": "bundle_unavailable",
+                    "action": "rebuild",
+                    "reason": "confirmed files failed verification",
+                    "problems": exc.problems,
+                },
+            )
+
+        background.add_task(_safe_remove, zip_path)
+
+        # ZIP is ready: only now decide whether it may be sent.
+        changed = store.recheck_bundle(key, files)
+        if changed is not None:
+            if changed["status"] == "disabled":
+                return JSONResponse(status_code=409, content=changed)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "input_key": key,
+                    "status": "bundle_unavailable",
+                    "action": "rebuild",
+                    "reason": "confirmed files changed while packaging",
+                },
+            )
+
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=f"{key}-bundle.zip",
+            headers={
+                "Content-Length": str(zip_size),
+                "X-Image-SHA256": files["image"]["sha256"],
+                "X-Symbols-SHA256": files["symbols"]["sha256"],
+                "X-Confirmed-By": ",".join(snapshot["confirmed_by"]),
+            },
+        )
+
     return app
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 app = create_app()
